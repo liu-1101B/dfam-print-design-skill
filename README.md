@@ -1,34 +1,49 @@
-# DfAM 建模技能（给 AI 用的 3D 打印设计规范）
+# DfAM 建模技能（给 AI 用的 3D 打印设计工作流）
 
-一个给 AI 编程助手加载的技能包：在**画第一根线之前**就把打印姿态、各向异性、层纹方向、自支撑角、线宽量化、配合公差定下来，而不是事后靠切片参数补救。
+一个给 AI 编程助手加载的技能包：先用经典力学判断零件会怎么坏，再把几何设计到不坏，最后才是打印规则。打印规则是约束，不是设计目标。
+
+## 这一版改了什么
+
+v1 是一套"打印规则集合"——先定姿态、层间各向异性、45° 自支撑、线宽整数倍。规则本身没错，但写成了绝对禁令，会诱导 AI 为了通过打印规则而牺牲结构性能。
+
+v2 重构成"力学优先，制造约束协同"：
+
+| 维度 | v1 | v2 |
+|---|---|---|
+| 核心命题 | "90% 在 CAD 里决定" | 删掉无依据的百分比，改为五步设计顺序 |
+| 力学 | 只有"主应力放 XY" | 失效模式表、初算公式、Kt、屈曲、疲劳、蠕变、安全系数 |
+| 层间折减 | 统一 0.5–0.7 | 分材料/条件，标 D3，要求实测替换，禁止当真实强度 |
+| 45° 法则 | 默认最优 | 候选方案之一，先比较姿态/几何/支撑/拆件四条路 |
+| 壁厚 | 必须线宽整数倍 | 启发式，不得覆盖强度与功能尺寸 |
+| 姿态 | 最省支撑 | 硬约束筛选 + 帕累托/显式权重，输出取舍依据 |
+| 预检器 | 单一 PASS/FAIL | 三段状态 + 力学恒为 UNKNOWN + 未实现项不默认通过 |
+| 评测 | 无 | 8 个案例 + 7 维评分 + 禁止结论清单 |
 
 ## 核心主张
 
-> 打印件的强度、外观、支撑量，90% 在 CAD 里就已经定了；切片参数只能做 ±10% 的补偿。
+> 打印件的性能由几何、材料本构、载荷与边界、打印方向、层间结合、走线、后处理共同决定。**不要在缺少证据时用固定百分比描述各占多少。**
+>
+> 任何规则都要带适用条件。经验规则只做筛选，不能替代计算与试验。
 
-四条不可谈判的物理事实，各自对应一条建模法则：
+冲突时按四层裁决，下层不得覆盖上层：
 
-| 事实 | 法则 |
-|---|---|
-| 层间是弱面（各向异性） | 主应力落在 XY 面内并沿走线；Z 向强度按 0.5–0.7 折减 |
-| 层厚是量化单位（台阶效应） | Z 向过渡只用 ≥45° 直平面；要光滑的弧面绕 Z 轴放 |
-| 悬垂需要支撑（45° 法则） | 悬垂改倒角/斜坡；水平孔改泪滴或菱形 |
-| 挤出是定量体积 | 壁厚/孔径 = N × 挤出线宽，不是 N × 喷嘴直径 |
-
-一个常被说错、这里刻意纠偏的点：**45° 倒角不"消除"层纹**，它把不规则宽台阶换成等宽细台阶。真无层纹只有后处理、熨烫或换工艺。
+1. **功能与安全**（强度、刚度、温度、寿命、装配）
+2. **制造可行**（设备、材料、支撑、最小特征、精度）
+3. **多目标优化**（质量、成本、时间、外观）
+4. **验证与交付**（预检、计算、试打、风险）
 
 ## 内容
 
 ```
-SKILL.md                       核心思想、8 步流程、数值表、决策规则、10 条交付前自检
-references/process-profiles.md FDM 八种材料 + 树脂/SLS/MJF/SLM 的数值、公差、收缩、后处理
-references/geometry-patterns.md 13 个几何配方（45° 过渡族、泪滴孔、桥接、拆件、卡扣、点阵…）
-scripts/dfam_preflight.py      无依赖预检：水密/法向一致/体积/悬垂率/首层接触/六姿态排序
+SKILL.md                        设计原则、冲突裁决、物理约束、力学判据、证据等级、姿态优化
+references/mechanics.md         截面特性、梁/轴/压杆/连接/卡扣公式、K 与 Kt、安全系数、蠕变、4 个算例
+references/process-profiles.md  材料 × 工艺 × 设备参数，数据来源分级 D0–D3，UNKNOWN 标记，标定方案
+references/geometry-patterns.md 18 张设计卡片（机制/适用性/对 σ k m P 的影响/定尺寸/失效/验证）
+scripts/dfam_preflight.py       几何预筛：结构化三段状态、帕累托姿态、UNKNOWN 不隐藏
+evals/                          8 个评测案例 + 评分协议，防止越改越差
 ```
 
 ## 安装
-
-放到全局技能目录（所有工作区生效）：
 
 ```bash
 git clone https://github.com/liu-1101B/dfam-print-design-skill.git ~/.dsh/skills/dfam-print-design
@@ -38,30 +53,45 @@ git clone https://github.com/liu-1101B/dfam-print-design-skill.git ~/.dsh/skills
 
 ## 用法
 
-- 对话里说"帮我设计一个夹具/外壳/卡扣"时技能会自动触发；
-- 也可以直接跑预检：
+- 说"帮我设计一个夹具/外壳/卡扣"时技能自动触发；
+- 也可以直接跑几何预筛：
 
 ```bash
-python scripts/dfam_preflight.py part.stl            # 人读报告
-python scripts/dfam_preflight.py part.stl --json     # 机器读
-python scripts/dfam_preflight.py part.stl --angle 50 # 换自支撑角
+python scripts/dfam_preflight.py part.stl
+python scripts/dfam_preflight.py part.stl --json
+python scripts/dfam_preflight.py part.stl --angle 50 --bed 256x256x256
+python scripts/dfam_preflight.py part.stl --weights support=.4,height=.2,contact=.2,ceiling=.2
 ```
 
-退出码 `0` = PASS/WARN，`1` = FAIL，可以直接当构建闸门用。
+退出码 `0` = PASS/WARN，`1` = FAIL，可直接当构建闸门。
 
-## 预检示例
+## 预检输出长什么样
 
 ```
-DfAM 预检 · part.stl
-网格   三角面 4416   顶点 2210   水密 是   法向一致 是   体积 2.13 cm³   表面积 2267 mm²
-包围盒 82.0 × 10.0 × 20.0 mm   首层接触 324 mm²（占包围盒 39.5%）
-悬垂   需支撑 0.0%（0.0 / 328.7 mm²）   水平天花板 0.0 mm²   自支撑面 5 mm²
-姿态   当前已是最省支撑的轴向姿态（0.0%）
-结论   PASS
+DfAM 几何预筛 · part.stl   [dfam_preflight 2.0]
+范围   geometric pre-screening only; not a mechanical validation
+网格   三角面 4416   顶点 2210   体积 2.13 cm³   表面积 2267 mm²
+包围盒 82.0 × 10.0 × 20.0 mm   首层接触 324 mm²（39.5%）   悬垂需支撑 0.0%
+几何   PASS
+制造   PASS
+力学   UNKNOWN
+   ?   S1 材料许用值
+   ?   S2 载荷与边界条件
+   ...
+姿态（四项几何指标；未给硬约束与权重）
+   as-is      支撑 0.0%  高 20.0 mm  首层 324 mm²  天花板 0.0 mm²   pareto
+   ...
+结论   PASS   （力学验证：UNKNOWN）
 ```
 
-依赖：Python 3.8+ 标准库，无需 numpy/trimesh。支持二进制/ASCII STL 与 3MF（含嵌套 component 变换）。
+**`PASS` 只代表几何与制造检查通过。** 力学项永远是 `UNKNOWN`，直到你提供载荷、许用值和证据等级。这是设计上的刻意选择，不是偷懒。
 
 ## 适用边界
 
-数值默认 FDM / 0.4 喷嘴 / 0.2 层高 / PETG。换工艺按 `process-profiles.md` 换算；承力、高温、人身安全件不能靠 FDM 保证，技能里明确要求写风险声明。
+- 默认 FDM / 0.4 喷嘴 / 0.2 层高 / PETG；换工艺查 `process-profiles.md`。
+- 承力、高温、人身安全件：技能要求标注证据等级，未达 E3 时必须写"初步设计，待验证"。
+- 预检器不做壁厚、自相交、真实支撑体积、时间估算——这些项返回 `UNKNOWN`，不装作通过。
+
+## 依赖
+
+Python 3.8+ 标准库。无需 numpy / trimesh。支持二进制/ASCII STL 与 3MF（含嵌套 component 变换）。

@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""DfAM preflight for a printable mesh: read-only geometry audit before slicing.
+"""DfAM geometric pre-screening for a printable mesh.
 
-Answers the questions a DfAM review asks before the slicer does:
-  * is the mesh closed and consistently oriented (will it slice at all)
-  * how much downward surface needs support at a given self-support angle
-  * how much bed contact the first layer gets
-  * which of the six axis-aligned print orientations is cheapest to print
+This tool answers GEOMETRY and MANUFACTURING questions only. It never claims a
+part is strong enough: every mechanics check is reported as UNKNOWN until a
+human supplies loads, allowables and an evidence grade.
 
 Usage:
     python dfam_preflight.py MODEL.stl [--json] [--angle 45] [--no-edges]
-    python dfam_preflight.py MODEL.3mf [--json] [--angle 45] [--no-edges]
+    python dfam_preflight.py MODEL.3mf [--bed 256x256x256]
+    python dfam_preflight.py MODEL.stl --weights support=.4,height=.2,contact=.2,ceiling=.2
 
 Reads binary/ASCII STL and 3MF (core spec, nested component transforms).
 Pure standard library: no numpy, no trimesh.
-Exit code 0 for PASS/WARN, 1 for FAIL, so it can gate a build step.
+Exit code 0 for PASS/WARN, 1 for FAIL, 2 for usage error.
 """
 
 import json
@@ -23,12 +22,20 @@ import sys
 import zipfile
 import xml.etree.ElementTree as ET
 
+TOOL = "dfam_preflight"
+VERSION = "2.0"
+SCOPE = "geometric pre-screening only; not a mechanical validation"
+
 NS_3MF = "{http://schemas.microsoft.com/3dmanufacturing/core/2015/02}"
 
 BED_EPS = 0.05          # mm: faces this close above the bed count as first layer
 FLAT_DEG = 5.0          # faces within 5 deg of horizontal are bridges/ceilings
-DEFAULT_ANGLE = 45.0    # self-support angle measured from horizontal
-WARN_CONTACT_RATIO = 0.15   # matches the 15% first-layer rule in SKILL.md
+DEFAULT_ANGLE = 45.0    # self-support angle from horizontal (a process parameter)
+CONTACT_WARN = 0.15     # first-layer contact / bounding-box footprint
+CONTACT_FAIL = 0.02
+SUPPORT_WARN = 0.02     # support-needing projected area / downward projected area
+SUPPORT_FAIL = 0.15
+CEILING_WARN = 1.0      # mm^2 of near-horizontal unsupported ceiling
 
 # ---------------------------------------------------------------- loading
 
@@ -163,9 +170,7 @@ def compose(a, b):
         for c in range(3):
             out.append(a[3 * r] * b[c] + a[3 * r + 1] * b[3 + c] + a[3 * r + 2] * b[6 + c])
     for r in range(3):
-        out.append(
-            a[3 * r] * b[9] + a[3 * r + 1] * b[10] + a[3 * r + 2] * b[11] + a[9 + r]
-        )
+        out.append(a[3 * r] * b[9] + a[3 * r + 1] * b[10] + a[3 * r + 2] * b[11] + a[9 + r])
     return out
 
 
@@ -192,11 +197,11 @@ def bbox(verts):
 
 
 def edge_health(tris):
-    """Return (boundary_edges, nonmanifold_edges, inconsistent_edges).
+    """Return (boundary, nonmanifold, inconsistent) edge counts.
 
-    Every undirected edge is packed as n | (s+128)<<8, where n is its triangle
-    count and s the walking-direction balance: a closed, consistently wound mesh
-    has n == 2 and s == 0 on every edge.
+    Each undirected edge is packed as n | (s+128)<<8, where n is its triangle
+    count and s the walking-direction balance: closed and consistently wound
+    means n == 2 and s == 0 on every edge.
     """
     counts = {}
     for a, b, c in tris:
@@ -219,9 +224,8 @@ def edge_health(tris):
     return boundary, nonmanifold, inconsistent
 
 
-# Rotation that brings a chosen local axis DOWN to global -Z. Each entry maps
-# local (x, y, z) to the printed frame; support ratio is invariant to spin
-# about Z, so these six cover every axis-aligned pose.
+# Rotation that brings a chosen local axis DOWN to global -Z. Support ratio is
+# invariant to spin about Z, so these six cover every axis-aligned pose.
 POSES = [
     ("as-is", None),
     ("倒置", lambda v: (v[0], -v[1], -v[2])),
@@ -230,6 +234,9 @@ POSES = [
     ("侧躺·绕Y", lambda v: (-v[2], v[1], v[0])),
     ("侧躺·绕Y反", lambda v: (v[2], v[1], -v[0])),
 ]
+
+POSE_KEYS = ("support_ratio", "height_mm", "contact_mm2", "flat_ceiling_mm2")
+POSE_BETTER = {"support_ratio": -1, "height_mm": -1, "contact_mm2": +1, "flat_ceiling_mm2": -1}
 
 
 def face_stats(verts, tris, angle):
@@ -276,32 +283,237 @@ def face_stats(verts, tris, angle):
 
 
 def score_poses(verts, tris, angle):
-    scored = []
+    rows = []
     for name, fn in POSES:
         moved = verts if fn is None else [fn(v) for v in verts]
         low = bbox(moved)[0][2]
         if low:
             moved = [(v[0], v[1], v[2] - low) for v in moved]
         st = face_stats(moved, tris, angle)
-        ratio = st["support_proj"] / st["down_proj"] if st["down_proj"] else 0.0
-        hi = bbox(moved)[1][2]
-        scored.append(
+        rows.append(
             {
                 "pose": name,
-                "support_ratio": ratio,
+                "support_ratio": st["support_proj"] / st["down_proj"] if st["down_proj"] else 0.0,
                 "support_mm2": st["support_proj"],
-                "height_mm": hi,
+                "height_mm": bbox(moved)[1][2],
+                "contact_mm2": st["contact"],
                 "flat_ceiling_mm2": st["flat_ceiling"],
+                "volume_mm3": st["volume"],
             }
         )
-    scored.sort(key=lambda r: (round(r["support_ratio"], 4), round(r["height_mm"], 2)))
-    return scored
+    flags, dominators = pareto_flags(rows)
+    for row, flag, count in zip(rows, flags, dominators):
+        row["pareto_optimal"] = flag
+        row["dominated_by"] = count
+    return rows
+
+
+def pareto_flags(rows, keys=POSE_KEYS, better=POSE_BETTER):
+    """Mark non-dominated rows and how many rows dominate each row.
+
+    No weights are implied by this ordering: it only removes poses that are
+    worse on every metric at once. Differences below a relative tolerance count
+    as ties, so near-identical poses are not split apart by float noise.
+    """
+    flags, dominators = [], []
+    for i, a in enumerate(rows):
+        count = 0
+        for j, b in enumerate(rows):
+            if i == j:
+                continue
+            not_worse, strictly = True, False
+            for k in keys:
+                delta = better[k] * (b[k] - a[k])
+                tol = 1e-6 * max(abs(a[k]), abs(b[k]), 1e-12)
+                if delta < -tol:
+                    not_worse = False
+                    break
+                if delta > tol:
+                    strictly = True
+            if not_worse and strictly:
+                count += 1
+        dominators.append(count)
+        flags.append(count == 0)
+    return flags, dominators
+
+
+def weighted_scores(rows, weights):
+    """Min-max normalise each metric, then apply explicit user weights."""
+    norms = {}
+    for key in POSE_KEYS:
+        values = [r[key] for r in rows]
+        lo, hi = min(values), max(values)
+        norms[key] = (lo, hi)
+    for row in rows:
+        score = 0.0
+        for key in POSE_KEYS:
+            lo, hi = norms[key]
+            if hi - lo <= 1e-12:
+                frac = 1.0
+            else:
+                frac = (row[key] - lo) / (hi - lo)
+                if POSE_BETTER[key] < 0:
+                    frac = 1.0 - frac
+            score += weights.get(key, 0.0) * frac
+        row["weighted_score"] = round(score, 4)
+    return {"method": "min-max over the six axis-aligned poses, lower is better", "weights": weights}
+
+
+# ---------------------------------------------------------------- checks
+
+
+def check(cid, name, state, value=None, limit=None, unit="", source="", note=""):
+    return {
+        "id": cid,
+        "name": name,
+        "state": state,
+        "value": value,
+        "limit": limit,
+        "unit": unit,
+        "source": source,
+        "note": note,
+    }
+
+
+def audit_geometry(verts, tris, st, check_edges=True):
+    boundary, nonmanifold, inconsistent = edge_health(tris) if check_edges else (0, 0, 0)
+    out = []
+    if check_edges:
+        out.append(check(
+            "G1", "网格封闭", "FAIL" if boundary or nonmanifold else "PASS",
+            boundary + nonmanifold, 0, "edges",
+            "边界边=1 次、非流形边>2 次都意味着壳不闭合",
+            "先修水密，否则切片结果不可预测",
+        ))
+        out.append(check(
+            "G2", "法向一致", "FAIL" if inconsistent else "PASS",
+            inconsistent, 0, "edges",
+            "闭合且绕向一致时每条边两次反向经过",
+            "绕向不一致会让体积与内外判定都失效",
+        ))
+    else:
+        out.append(check("G1", "网格封闭", "UNKNOWN", None, 0, "edges", "--no-edges", "本次未检查"))
+        out.append(check("G2", "法向一致", "UNKNOWN", None, 0, "edges", "--no-edges", "本次未检查"))
+    out.append(check(
+        "G3", "无退化三角面", "WARN" if st["degenerate"] else "PASS",
+        st["degenerate"], 0, "faces", "面积 < 1e-12 的三角面",
+        "重复顶点或共线，建议清理",
+    ))
+    out.append(check(
+        "G4", "体积为正", "FAIL" if st["volume"] <= 0 else "PASS",
+        round(st["volume"], 3), 0, "mm3", "散度定理对闭合壳求和",
+        "为负说明法向整体朝内",
+    ))
+    out.append(check(
+        "G5", "无自相交", "UNKNOWN", None, None, "", "未实现",
+        "壳相互穿插时应力与切片都不可预测，需在 CAD 里检查",
+    ))
+    return out
+
+
+def audit_manufacturing(st, size, angle, bed):
+    footprint = size[0] * size[1]
+    ratio = st["support_proj"] / st["down_proj"] if st["down_proj"] else 0.0
+    contact_ratio = st["contact"] / footprint if footprint else 0.0
+    out = []
+    if ratio > SUPPORT_FAIL:
+        state, note = "FAIL", "改几何（见 geometry-patterns.md 卡片 2/5/6）或换姿态（见 poses）"
+    elif ratio > SUPPORT_WARN:
+        state, note = "WARN", "少量支撑；先比较改几何与换姿态的成本"
+    else:
+        state, note = "PASS", "当前姿态在给定自支撑角下基本免支撑"
+    out.append(check(
+        "M1", "悬垂需支撑率", state, round(ratio, 4), SUPPORT_FAIL, "ratio",
+        "下向投影面积中超过 %.0f° 的部分 / 全部下向投影" % angle, note,
+    ))
+    out.append(check(
+        "M2", "水平天花板/桥接", "WARN" if st["flat_ceiling"] > CEILING_WARN else "PASS",
+        round(st["flat_ceiling"], 2), CEILING_WARN, "mm2",
+        "与水平夹角 < %.0f° 的下向面" % FLAT_DEG,
+        "桥接须两端锚固，否则改斜坡或拆件",
+    ))
+    if contact_ratio < CONTACT_FAIL:
+        c_state, c_note = "FAIL", "首层接触过低，几乎必然脱板：加底面积/耳片或 brim"
+    elif contact_ratio < CONTACT_WARN:
+        c_state, c_note = "WARN", "首层接触偏低：加底面积/耳片或 brim"
+    else:
+        c_state, c_note = "PASS", "首层接触充足"
+    out.append(check(
+        "M3", "首层接触", c_state, round(contact_ratio, 4), CONTACT_WARN, "ratio",
+        "床面朝下面积 / 包围盒底面积", c_note,
+    ))
+    if bed is None:
+        out.append(check(
+            "M4", "成形空间", "UNKNOWN", None, None, "mm", "未提供 --bed",
+            "用 --bed 256x256x256 才能检查",
+        ))
+    else:
+        over = [round(size[i] - bed[i], 2) for i in range(3)]
+        fits = all(size[i] <= bed[i] + 1e-9 for i in range(3))
+        out.append(check(
+            "M4", "成形空间", "PASS" if fits else "FAIL", over, 0, "mm overflow",
+            "包围盒 vs %.0fx%.0fx%.0f" % bed, "超出时拆件或换设备",
+        ))
+    out.append(check("M5", "最小壁厚", "UNKNOWN", None, None, "mm", "未实现",
+                     "需体素化或射线法，当前不提供结论"))
+    out.append(check("M6", "实际支撑体积与难拆区", "UNKNOWN", None, None, "mm3", "未实现",
+                     "需切片器数据，几何预筛无法代替"))
+    out.append(check("M7", "打印时间与材料消耗", "UNKNOWN", None, None, "", "未实现",
+                     "需切片器估算"))
+    out.append(check("M8", "尺寸精度与收缩", "UNKNOWN", None, None, "mm", "未实现",
+                     "与设备、材料、尺寸相关，须实测首件"))
+    return out
+
+
+def audit_mechanics():
+    items = [
+        ("S1", "材料许用值", "缺同材料/同设备/同方向的 σ_xy、σ_z、E"),
+        ("S2", "载荷与边界条件", "缺载荷大小/方向/作用点与支承方式"),
+        ("S3", "强度（σ 与许用值）", "需按 mechanics.md 算危险截面"),
+        ("S4", "刚度与变形", "需给出位移上限并计算挠度"),
+        ("S5", "稳定性与屈曲", "长细比、薄壁板格需单独校核"),
+        ("S6", "疲劳与冲击", "循环次数或冲击能量未知"),
+        ("S7", "连接与孔边", "净截面、承压、边距需校核"),
+        ("S8", "蠕变与温度", "工作温度与 Tg/HDT 的关系未知"),
+    ]
+    return [
+        check(cid, name, "UNKNOWN", None, None, "", "需要人工输入", hint + "；见 references/mechanics.md")
+        for cid, name, hint in items
+    ]
+
+
+ACTIONS = {
+    "G1": "修水密：合并重复顶点、封闭开口、删除内部悬空壳",
+    "G2": "统一法向：在 CAD 或切片器里重算法向/翻转内部壳",
+    "G3": "清理退化面：删除零面积三角面与共线顶点",
+    "G4": "整体翻转法向，或修掉内外颠倒的壳体",
+    "G5": "在 CAD 里检查干涉/自相交，用布尔并集合并重叠实体",
+    "M1": "改几何（倒角/斜坡/泪滴孔/拆件）或换姿态；两者成本要比较",
+    "M2": "桥接两端加锚固平台，或改 45° 斜坡/拆件",
+    "M3": "加底面积、加耳片、加 brim，或换姿态让大面贴床",
+    "M4": "拆件、缩小尺寸或改用更大成形空间的设备",
+    "M5": "用切片预览确认最薄处，必要时用体素工具测壁厚",
+    "M6": "用切片器算支撑体积与难拆区，再决定改几何还是改姿态",
+    "M7": "用切片器估算时间与材料，纳入成本比较",
+    "M8": "打首件实测关键尺寸，据此修正补偿量",
+}
+
+
+def summarise(checks):
+    states = [c["state"] for c in checks]
+    if "FAIL" in states:
+        return "FAIL"
+    if "WARN" in states:
+        return "WARN"
+    if states and all(s == "UNKNOWN" for s in states):
+        return "UNKNOWN"
+    return "PASS"
 
 
 # ---------------------------------------------------------------- report
 
 
-def analyse(path, angle=DEFAULT_ANGLE, check_edges=True):
+def analyse(path, angle=DEFAULT_ANGLE, bed=None, weights=None, check_edges=True):
     if path.lower().endswith(".3mf"):
         verts, tris = load_3mf(path)
     else:
@@ -310,123 +522,155 @@ def analyse(path, angle=DEFAULT_ANGLE, check_edges=True):
         raise ValueError("no triangles found")
 
     lo, hi = bbox(verts)
-    st = face_stats(verts, tris, angle)
-    boundary, nonmanifold, inconsistent = edge_health(tris) if check_edges else (0, 0, 0)
-
     size = (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2])
+    st = face_stats(verts, tris, angle)
+
+    geometry = audit_geometry(verts, tris, st, check_edges)
+    manufacturing = audit_manufacturing(st, size, angle, bed)
+    mechanics = audit_mechanics()
+    poses = score_poses(verts, tris, angle)
+    scoring = weighted_scores(poses, weights) if weights else None
+
+    verdict = summarise(geometry + manufacturing)
+    actions = []
+    for c in geometry + manufacturing:
+        if c["state"] in ("FAIL", "WARN") and c["id"] in ACTIONS:
+            actions.append("%s %s：%s" % (c["id"], c["name"], ACTIONS[c["id"]]))
+    if verdict != "FAIL":
+        actions.append("几何预筛不能替代强度校核：承力件按 references/mechanics.md 补算或做 E3 试件")
+
     footprint = size[0] * size[1]
-    ratio = st["support_proj"] / st["down_proj"] if st["down_proj"] else 0.0
-    contact_ratio = st["contact"] / footprint if footprint else 0.0
-
-    fails, warns = [], []
-    if st["volume"] < 0:
-        fails.append("体积为负：法向整体朝内，切片器会当成空腔——先在 CAD 里统一法向")
-    if boundary or nonmanifold:
-        fails.append(
-            "网格不封闭：边界边 %d 条、非流形边 %d 条——先修水密，否则切片不可预测"
-            % (boundary, nonmanifold)
-        )
-    if inconsistent:
-        fails.append(
-            "面朝向不一致：%d 条边两侧同向，体积与内外判定都不可信——先统一法向" % inconsistent
-        )
-    if st["degenerate"]:
-        warns.append("退化三角面 %d 个（面积≈0）：多为重复顶点或共线，建议清理" % st["degenerate"])
-    if ratio > 0.15:
-        fails.append(
-            "悬垂超过 %.0f° 的面占下向投影 %.1f%%：必须改几何（45° 倒角/斜坡/泪滴孔）或接受大量支撑"
-            % (angle, ratio * 100)
-        )
-    elif ratio > 0.02:
-        warns.append(
-            "悬垂超过 %.0f° 的面占下向投影 %.1f%%（%.1f mm²）：少量支撑；能改成 45° 斜面就改"
-            % (angle, ratio * 100, st["support_proj"])
-        )
-    if st["flat_ceiling"] > 1.0:
-        warns.append(
-            "水平天花板 %.1f mm²：桥接必须两端锚固，否则改斜坡或拆件" % st["flat_ceiling"]
-        )
-    if contact_ratio < WARN_CONTACT_RATIO:
-        warns.append(
-            "首层接触仅 %.0f mm²（占包围盒 %.1f%%）：加底面积/耳片或 brim，否则易脱板"
-            % (st["contact"], contact_ratio * 100)
-        )
-
-    verdict = "FAIL" if fails else ("WARN" if warns else "PASS")
     return {
+        "tool": TOOL,
+        "version": VERSION,
+        "scope": SCOPE,
         "file": path,
         "verdict": verdict,
-        "fails": fails,
-        "warns": warns,
-        "mesh": {
-            "vertices": len(verts),
+        "verification": {
+            "level": "E0",
+            "geometric_screening": verdict,
+            "mechanical_validation": "UNKNOWN",
+            "statement": "几何预筛通过不等于结构验证通过；承力件需补算或实测。",
+        },
+        "geometry_status": {"state": summarise(geometry), "checks": geometry},
+        "manufacturing_status": {"state": summarise(manufacturing), "checks": manufacturing},
+        "mechanics_status": {
+            "state": "UNKNOWN",
+            "reason": "本工具不读取载荷、许用值与证据等级，力学项一律返回 UNKNOWN",
+            "checks": mechanics,
+        },
+        "assumptions": [
+            "自支撑角 %.0f°（工艺参数，应用时须按材料/层高/冷却实测）" % angle,
+            "首层判定容差 %.2f mm" % BED_EPS,
+            "首层接触阈值 %.0f%% 包围盒底面积" % (CONTACT_WARN * 100),
+            "悬垂失败阈值 %.0f%% 下向投影" % (SUPPORT_FAIL * 100),
+            "材料许用值未指定，全部力学结论为 UNKNOWN",
+            "未做壁厚、自相交、支撑体积、时间估算",
+        ],
+        "unknowns": [c["id"] + " " + c["name"] for c in geometry + manufacturing + mechanics if c["state"] == "UNKNOWN"],
+        "warnings": [c["id"] + " " + c["name"] + "：" + c["note"] for c in geometry + manufacturing if c["state"] == "WARN"],
+        "recommended_actions": actions,
+        "metrics": {
             "triangles": len(tris),
-            "watertight": (boundary == 0 and nonmanifold == 0) if check_edges else None,
-            "consistent": (inconsistent == 0) if check_edges else None,
-            "boundary_edges": boundary,
-            "nonmanifold_edges": nonmanifold,
-            "inconsistent_edges": inconsistent,
-            "degenerate": st["degenerate"],
-            "volume_mm3": st["volume"],
-            "area_mm2": st["area"],
+            "vertices": len(verts),
+            "volume_mm3": round(st["volume"], 3),
+            "area_mm2": round(st["area"], 2),
+            "box_mm": [round(v, 3) for v in size],
+            "footprint_mm2": round(footprint, 2),
+            "first_layer_contact_mm2": round(st["contact"], 2),
+            "first_layer_contact_ratio": round(st["contact"] / footprint, 4) if footprint else 0.0,
+            "overhang_support_mm2": round(st["support_proj"], 2),
+            "overhang_support_ratio": round(st["support_proj"] / st["down_proj"], 4) if st["down_proj"] else 0.0,
+            "flat_ceiling_mm2": round(st["flat_ceiling"], 2),
+            "self_supported_mm2": round(st["steep_proj"], 2),
         },
-        "box": {"size": size, "min": lo, "max": hi, "footprint_mm2": footprint},
-        "first_layer": {"contact_mm2": st["contact"], "contact_ratio": contact_ratio},
-        "overhang": {
-            "self_support_deg": angle,
-            "support_mm2": st["support_proj"],
-            "support_ratio": ratio,
-            "down_proj_mm2": st["down_proj"],
-            "flat_ceiling_mm2": st["flat_ceiling"],
-            "self_supported_mm2": st["steep_proj"],
-        },
-        "poses": score_poses(verts, tris, angle),
+        "poses": poses,
+        "pose_scoring": scoring,
     }
 
 
+MARK = {"PASS": "ok ", "WARN": "warn", "FAIL": "FAIL", "UNKNOWN": "?  "}
+
+
+def fmt_check_value(c):
+    """Render one check's value for the human report."""
+    if c["value"] is None:
+        return ""
+    value, unit = c["value"], c["unit"]
+    if unit == "ratio":
+        return " = %.1f%%" % (value * 100)
+    if isinstance(value, list):
+        return " = 超限 " + ", ".join("%g" % v for v in value) + (" " + unit if unit else "")
+    text = " = %s" % value
+    if unit:
+        text += " " + unit.replace("mm2", "mm²").replace("mm3", "mm³")
+    return text
+
+
 def render(r):
-    m, b, o = r["mesh"], r["box"], r["overhang"]
-    sx, sy, sz = b["size"]
-    out = ["DfAM 预检 · %s" % r["file"]]
+    m = r["metrics"]
+    out = ["DfAM 几何预筛 · %s   [%s %s]" % (r["file"], TOOL, r["version"])]
+    out.append("范围   %s" % r["scope"])
     out.append(
-        "网格   三角面 %d   顶点 %d   水密 %s   法向一致 %s   体积 %.2f cm³   表面积 %.0f mm²"
+        "网格   三角面 %d   顶点 %d   体积 %.2f cm³   表面积 %.0f mm²"
+        % (m["triangles"], m["vertices"], m["volume_mm3"] / 1000.0, m["area_mm2"])
+    )
+    out.append(
+        "包围盒 %.1f × %.1f × %.1f mm   首层接触 %.0f mm²（%.1f%%）   悬垂需支撑 %.1f%%"
         % (
-            m["triangles"],
-            m["vertices"],
-            "—" if m["watertight"] is None else ("是" if m["watertight"] else "否"),
-            "—" if m["consistent"] is None else ("是" if m["consistent"] else "否"),
-            m["volume_mm3"] / 1000.0,
-            m["area_mm2"],
+            m["box_mm"][0], m["box_mm"][1], m["box_mm"][2],
+            m["first_layer_contact_mm2"], m["first_layer_contact_ratio"] * 100,
+            m["overhang_support_ratio"] * 100,
         )
     )
-    out.append(
-        "包围盒 %.1f × %.1f × %.1f mm   首层接触 %.0f mm²（占包围盒 %.1f%%）"
-        % (sx, sy, sz, r["first_layer"]["contact_mm2"], r["first_layer"]["contact_ratio"] * 100)
-    )
-    out.append(
-        "悬垂   需支撑 %.1f%%（%.1f / %.1f mm²）   水平天花板 %.1f mm²   自支撑面 %.0f mm²"
-        % (
-            o["support_ratio"] * 100,
-            o["support_mm2"],
-            o["down_proj_mm2"],
-            o["flat_ceiling_mm2"],
-            o["self_supported_mm2"],
-        )
-    )
-    best = [p for p in r["poses"] if p["pose"] != "as-is"]
-    if best and best[0]["support_ratio"] < o["support_ratio"] - 0.005:
+    for title, key in (("几何", "geometry_status"), ("制造", "manufacturing_status"), ("力学", "mechanics_status")):
+        block = r[key]
+        out.append("%s   %s" % (title, block["state"]))
+        for c in block["checks"]:
+            if c["state"] == "PASS" and title != "力学":
+                continue
+            out.append("   %s %s %s%s" % (MARK[c["state"]], c["id"], c["name"], fmt_check_value(c)))
+    out.append("姿态（四项几何指标：支撑率↓ 高度↓ 首层接触↑ 天花板↓；未给硬约束与权重）")
+    for p in r["poses"]:
         out.append(
-            "姿态   当前 %.1f%% → 换成「%s」可降到 %.1f%%（高 %.1f mm）"
-            % (o["support_ratio"] * 100, best[0]["pose"], best[0]["support_ratio"] * 100, best[0]["height_mm"])
+            "   %-10s 支撑 %.1f%%  高 %.1f mm  首层 %.0f mm²  天花板 %.1f mm²   %s"
+            % (
+                p["pose"], p["support_ratio"] * 100, p["height_mm"],
+                p["contact_mm2"], p["flat_ceiling_mm2"],
+                "pareto" if p["pareto_optimal"] else "被 %d 个姿态支配" % p["dominated_by"],
+            )
         )
-    else:
-        out.append("姿态   当前已是最省支撑的轴向姿态（%.1f%%）" % (o["support_ratio"] * 100))
-    out.append("结论   %s" % r["verdict"])
-    for msg in r["fails"]:
-        out.append("   x " + msg)
-    for msg in r["warns"]:
-        out.append("   ! " + msg)
+    if r["pose_scoring"]:
+        out.append("加权评分 %s" % json.dumps(r["pose_scoring"]["weights"], ensure_ascii=False))
+        for p in sorted(r["poses"], key=lambda x: -x.get("weighted_score", 0)):
+            out.append("   %-10s score=%.4f" % (p["pose"], p.get("weighted_score", 0)))
+    out.append("结论   %s   （力学验证：UNKNOWN）" % r["verdict"])
+    for msg in r["recommended_actions"]:
+        out.append("   -> " + msg)
     return "\n".join(out)
+
+
+def parse_bed(text):
+    parts = text.lower().replace("*", "x").replace(",", "x").split("x")
+    if len(parts) != 3:
+        raise SystemExit("--bed expects three numbers like 256x256x256")
+    return tuple(float(p) for p in parts)
+
+
+def parse_weights(text):
+    weights = {}
+    for chunk in text.split(","):
+        if not chunk.strip():
+            continue
+        key, _, value = chunk.partition("=")
+        key = key.strip()
+        aliases = {"support": "support_ratio", "height": "height_mm",
+                   "contact": "contact_mm2", "ceiling": "flat_ceiling_mm2"}
+        key = aliases.get(key, key)
+        if key not in POSE_KEYS:
+            raise SystemExit("unknown weight key: %s (use support/height/contact/ceiling)" % key)
+        weights[key] = float(value)
+    return weights
 
 
 def main(argv):
@@ -436,6 +680,9 @@ def main(argv):
         except (AttributeError, OSError):
             pass
     args, flags = [], set()
+    angle = DEFAULT_ANGLE
+    bed = None
+    weights = None
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -445,22 +692,30 @@ def main(argv):
             flags.add("no-edges")
         elif a == "--angle":
             i += 1
-            flags.add("angle=" + argv[i])
+            angle = float(argv[i])
         elif a.startswith("--angle="):
-            flags.add("angle=" + a.split("=", 1)[1])
+            angle = float(a.split("=", 1)[1])
+        elif a == "--bed":
+            i += 1
+            bed = parse_bed(argv[i])
+        elif a.startswith("--bed="):
+            bed = parse_bed(a.split("=", 1)[1])
+        elif a == "--weights":
+            i += 1
+            weights = parse_weights(argv[i])
+        elif a.startswith("--weights="):
+            weights = parse_weights(a.split("=", 1)[1])
         elif a.startswith("--"):
             raise SystemExit("unknown flag: " + a)
         else:
             args.append(a)
         i += 1
     if not args:
-        print("usage: python dfam_preflight.py MODEL.stl|MODEL.3mf [--json] [--angle 45] [--no-edges]")
+        print("usage: python dfam_preflight.py MODEL.stl|MODEL.3mf [--json] [--angle 45] "
+              "[--bed 256x256x256] [--weights support=.4,height=.2] [--no-edges]")
         return 2
-    angle = DEFAULT_ANGLE
-    for f in flags:
-        if f.startswith("angle="):
-            angle = float(f.split("=", 1)[1])
-    result = analyse(args[0], angle=angle, check_edges="no-edges" not in flags)
+    result = analyse(args[0], angle=angle, bed=bed, weights=weights,
+                     check_edges="no-edges" not in flags)
     if "json" in flags:
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
