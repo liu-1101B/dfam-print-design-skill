@@ -95,3 +95,9 @@ DfAM 几何预筛 · part.stl   [dfam_preflight 2.0]
 ## 依赖
 
 Python 3.8+ 标准库。无需 numpy / trimesh。支持二进制/ASCII STL 与 3MF（含嵌套 component 变换）。
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。可商用、修改、再分发，保留版权与许可声明即可。
+
+**免责**：本技能给出的是工程判断方法，不构成对任何具体零件的安全保证。承力、高温、人身安全相关用途须自行完成计算与试验验证。
